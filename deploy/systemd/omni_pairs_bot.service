@@ -1,0 +1,43 @@
+[Unit]
+Description=Monk Bot - BTC/ETH Divergence Alert Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=monkbot
+Group=monkbot
+WorkingDirectory=/opt/monk_bot
+EnvironmentFile=/opt/monk_bot/.env
+ExecStart=/opt/monk_bot/venv/bin/python /opt/monk_bot/bot.py
+Restart=always
+RestartSec=30
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=omni_pairs_bot
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+ReadWritePaths=/opt/monk_bot
+
+# Network - only allow outbound
+RestrictAddressFamilies=AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+IPAddressAllow=0.0.0.0/0
+
+[Install]
+WantedBy=multi-user.target
