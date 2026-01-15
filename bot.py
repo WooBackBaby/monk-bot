@@ -6,10 +6,11 @@ Monitors BTC/ETH price divergence and sends Telegram alerts
 for ENTRY, EXIT, and INVALIDATION signals.
 """
 import time
+import threading
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import Enum
-from typing import Optional, Tuple, NamedTuple
+from typing import Optional, Tuple, List, NamedTuple
 
 import requests
 
@@ -29,6 +30,13 @@ from config import (
 
 
 # =============================================================================
+# Constants
+# =============================================================================
+LOOKBACK_HOURS = 24
+HISTORY_BUFFER_MINUTES = 30  # Extra buffer beyond 24h
+
+
+# =============================================================================
 # Data Structures
 # =============================================================================
 class Mode(Enum):
@@ -41,6 +49,12 @@ class Strategy(Enum):
     S2 = "S2"  # Long ETH / Short BTC (when ETH dumps more)
 
 
+class PricePoint(NamedTuple):
+    timestamp: datetime
+    btc: Decimal
+    eth: Decimal
+
+
 class PriceData(NamedTuple):
     btc_price: Decimal
     eth_price: Decimal
@@ -51,10 +65,20 @@ class PriceData(NamedTuple):
 # =============================================================================
 # Global State
 # =============================================================================
-previous_btc: Optional[Decimal] = None
-previous_eth: Optional[Decimal] = None
+price_history: List[PricePoint] = []
 current_mode: Mode = Mode.SCAN
 active_strategy: Optional[Strategy] = None
+
+# Runtime settings (can be changed via Telegram commands)
+settings = {
+    "scan_interval": SCAN_INTERVAL_SECONDS,
+    "entry_threshold": ENTRY_THRESHOLD,
+    "exit_threshold": EXIT_THRESHOLD,
+    "invalidation_threshold": INVALIDATION_THRESHOLD,
+}
+
+# Track last processed update to avoid duplicates
+last_update_id: int = 0
 
 
 # =============================================================================
@@ -89,6 +113,232 @@ def send_alert(message: str) -> bool:
 
 
 # =============================================================================
+# Telegram Command Handling
+# =============================================================================
+# Long polling timeout - Telegram keeps connection open until update arrives
+LONG_POLL_TIMEOUT = 30  # seconds
+
+
+def get_telegram_updates() -> list:
+    """
+    Fetch new messages/commands from Telegram using long polling.
+    
+    Long polling is Telegram's recommended approach - the connection stays
+    open until an update arrives (or timeout), avoiding constant requests.
+    """
+    global last_update_id
+    
+    if not TELEGRAM_BOT_TOKEN:
+        return []
+    
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+        # Long polling: Telegram holds connection open until update or timeout
+        params = {"offset": last_update_id + 1, "timeout": LONG_POLL_TIMEOUT}
+        # Request timeout must be > long poll timeout
+        response = requests.get(url, params=params, timeout=LONG_POLL_TIMEOUT + 5)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get("ok") and data.get("result"):
+            updates = data["result"]
+            if updates:
+                last_update_id = updates[-1]["update_id"]
+            return updates
+    except requests.RequestException as e:
+        logger.debug(f"Failed to get updates: {e}")
+    
+    return []
+
+
+def process_commands() -> None:
+    """Process incoming Telegram commands."""
+    updates = get_telegram_updates()
+    
+    for update in updates:
+        message = update.get("message", {})
+        text = message.get("text", "")
+        chat_id = str(message.get("chat", {}).get("id", ""))
+        user_id = str(message.get("from", {}).get("id", ""))
+        
+        # Accept commands from the configured channel/group OR from DMs
+        # For DMs, the chat_id equals the user_id
+        is_authorized = (chat_id == TELEGRAM_CHAT_ID) or (chat_id == user_id)
+        
+        if not is_authorized:
+            logger.debug(f"Ignoring command from unauthorized chat: {chat_id}")
+            continue
+        
+        if not text.startswith("/"):
+            continue
+        
+        # Store the reply chat for command responses
+        reply_chat = chat_id
+        
+        parts = text.split()
+        command = parts[0].lower().split("@")[0]  # Handle /command@botname format
+        args = parts[1:] if len(parts) > 1 else []
+        
+        logger.info(f"Processing command: {command} from chat {chat_id}")
+        
+        if command == "/settings":
+            handle_settings_command(reply_chat)
+        elif command == "/interval":
+            handle_interval_command(args, reply_chat)
+        elif command == "/threshold":
+            handle_threshold_command(args, reply_chat)
+        elif command == "/help":
+            handle_help_command(reply_chat)
+        elif command == "/status":
+            handle_status_command(reply_chat)
+        elif command == "/start":
+            handle_help_command(reply_chat)
+
+
+def send_reply(message: str, chat_id: str) -> bool:
+    """Send a reply to a specific chat."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    
+    try:
+        response = requests.post(
+            TELEGRAM_API_URL,
+            json={
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        return True
+    except requests.RequestException as e:
+        logger.error(f"Failed to send reply: {e}")
+        return False
+
+
+def handle_settings_command(reply_chat: str) -> None:
+    """Show current settings."""
+    message = (
+        "⚙️ *Current Settings*\n"
+        "\n"
+        f"📊 Scan Interval: {settings['scan_interval']} seconds ({settings['scan_interval'] // 60} min)\n"
+        f"📈 Entry Threshold: ±{settings['entry_threshold']}%\n"
+        f"📉 Exit Threshold: ±{settings['exit_threshold']}%\n"
+        f"⚠️ Invalidation: ±{settings['invalidation_threshold']}%\n"
+        "\n"
+        "*Commands:*\n"
+        "`/interval <seconds>` - Set scan interval\n"
+        "`/threshold <entry> <exit> <invalid>` - Set thresholds\n"
+        "`/status` - Show bot status\n"
+        "`/help` - Show all commands"
+    )
+    send_reply(message, reply_chat)
+
+
+def handle_interval_command(args: list, reply_chat: str) -> None:
+    """Set scan interval."""
+    if not args:
+        send_reply("❌ Usage: `/interval <seconds>`\nExample: `/interval 300`", reply_chat)
+        return
+    
+    try:
+        new_interval = int(args[0])
+        if new_interval < 60:
+            send_reply("❌ Minimum interval is 60 seconds", reply_chat)
+            return
+        if new_interval > 3600:
+            send_reply("❌ Maximum interval is 3600 seconds (1 hour)", reply_chat)
+            return
+        
+        settings["scan_interval"] = new_interval
+        send_reply(f"✅ Scan interval set to *{new_interval} seconds* ({new_interval // 60} min)", reply_chat)
+        logger.info(f"Scan interval changed to {new_interval}s via command")
+    except ValueError:
+        send_reply("❌ Invalid number. Usage: `/interval <seconds>`", reply_chat)
+
+
+def handle_threshold_command(args: list, reply_chat: str) -> None:
+    """Set thresholds."""
+    if len(args) < 1:
+        send_reply(
+            "❌ Usage:\n"
+            "`/threshold entry <value>` - Set entry threshold\n"
+            "`/threshold exit <value>` - Set exit threshold\n"
+            "`/threshold invalid <value>` - Set invalidation\n"
+            "\nExample: `/threshold entry 2.5`",
+            reply_chat
+        )
+        return
+    
+    if len(args) < 2:
+        send_reply("❌ Please provide a value. Example: `/threshold entry 2.5`", reply_chat)
+        return
+    
+    try:
+        threshold_type = args[0].lower()
+        value = float(args[1])
+        
+        if value <= 0:
+            send_reply("❌ Threshold must be positive", reply_chat)
+            return
+        if value > 20:
+            send_reply("❌ Maximum threshold is 20%", reply_chat)
+            return
+        
+        if threshold_type == "entry":
+            settings["entry_threshold"] = value
+            send_reply(f"✅ Entry threshold set to *±{value}%*", reply_chat)
+        elif threshold_type == "exit":
+            settings["exit_threshold"] = value
+            send_reply(f"✅ Exit threshold set to *±{value}%*", reply_chat)
+        elif threshold_type in ("invalid", "invalidation"):
+            settings["invalidation_threshold"] = value
+            send_reply(f"✅ Invalidation threshold set to *±{value}%*", reply_chat)
+        else:
+            send_reply("❌ Unknown threshold type. Use: `entry`, `exit`, or `invalid`", reply_chat)
+        
+        logger.info(f"Threshold {threshold_type} changed to {value} via command")
+    except ValueError:
+        send_reply("❌ Invalid number", reply_chat)
+
+
+def handle_help_command(reply_chat: str) -> None:
+    """Show help message."""
+    message = (
+        "🤖 *Monk Bot Commands*\n"
+        "\n"
+        "*Settings:*\n"
+        "`/settings` - Show current settings\n"
+        "`/interval <sec>` - Set scan interval (60-3600)\n"
+        "`/threshold entry <val>` - Entry threshold %\n"
+        "`/threshold exit <val>` - Exit threshold %\n"
+        "`/threshold invalid <val>` - Invalidation %\n"
+        "\n"
+        "*Info:*\n"
+        "`/status` - Show bot status\n"
+        "`/help` - This message"
+    )
+    send_reply(message, reply_chat)
+
+
+def handle_status_command(reply_chat: str) -> None:
+    """Show bot status."""
+    hours_of_data = len(price_history) * settings["scan_interval"] / 3600
+    
+    message = (
+        "📊 *Bot Status*\n"
+        "\n"
+        f"Mode: {current_mode.value}\n"
+        f"Active Strategy: {active_strategy.value if active_strategy else 'None'}\n"
+        f"History: {hours_of_data:.1f}h collected\n"
+        f"Data Points: {len(price_history)}\n"
+    )
+    send_reply(message, reply_chat)
+
+
+# =============================================================================
 # Value Formatting
 # =============================================================================
 def format_value(value: Decimal) -> str:
@@ -115,10 +365,10 @@ def build_entry_message(strategy: Strategy, btc_ret: Decimal, eth_ret: Decimal, 
     """Build ENTRY alert message."""
     if strategy == Strategy.S1:
         direction = "📈 Long BTC / Short ETH"
-        reason = "ETH pumped more than BTC"
+        reason = "ETH pumped more than BTC (24h)"
     else:
         direction = "📈 Long ETH / Short BTC"
-        reason = "ETH dumped more than BTC"
+        reason = "ETH dumped more than BTC (24h)"
 
     return (
         f"🚨 *ENTRY SIGNAL: {strategy.value}*\n"
@@ -126,7 +376,7 @@ def build_entry_message(strategy: Strategy, btc_ret: Decimal, eth_ret: Decimal, 
         f"{direction}\n"
         f"_{reason}_\n"
         f"\n"
-        f"*Change Since Last Scan:*\n"
+        f"*24h Change:*\n"
         f"┌─────────────────────\n"
         f"│ BTC:  {format_value(btc_ret)}%\n"
         f"│ ETH:  {format_value(eth_ret)}%\n"
@@ -144,7 +394,7 @@ def build_exit_message(btc_ret: Decimal, eth_ret: Decimal, gap: Decimal) -> str:
         f"\n"
         f"Gap converged - position profitable.\n"
         f"\n"
-        f"*Change Since Last Scan:*\n"
+        f"*24h Change:*\n"
         f"┌─────────────────────\n"
         f"│ BTC:  {format_value(btc_ret)}%\n"
         f"│ ETH:  {format_value(eth_ret)}%\n"
@@ -162,7 +412,7 @@ def build_invalidation_message(strategy: Strategy, btc_ret: Decimal, eth_ret: De
         f"\n"
         f"Gap widened further - consider closing.\n"
         f"\n"
-        f"*Change Since Last Scan:*\n"
+        f"*24h Change:*\n"
         f"┌─────────────────────\n"
         f"│ BTC:  {format_value(btc_ret)}%\n"
         f"│ ETH:  {format_value(eth_ret)}%\n"
@@ -170,30 +420,6 @@ def build_invalidation_message(strategy: Strategy, btc_ret: Decimal, eth_ret: De
         f"└─────────────────────\n"
         f"\n"
         f"🔍 Returning to scan mode"
-    )
-
-
-def build_no_signal_message(btc_price: Decimal, eth_price: Decimal, btc_ret: Decimal, eth_ret: Decimal, gap: Decimal) -> str:
-    """Build no-signal status message."""
-    return (
-        f"🔍 *Scan Complete*\n"
-        f"\n"
-        f"No divergence detected.\n"
-        f"\n"
-        f"💰 *Current Prices:*\n"
-        f"┌─────────────────────\n"
-        f"│ BTC: ${float(btc_price):,.2f}\n"
-        f"│ ETH: ${float(eth_price):,.2f}\n"
-        f"└─────────────────────\n"
-        f"\n"
-        f"*Change Since Last Scan:*\n"
-        f"┌─────────────────────\n"
-        f"│ BTC:  {format_value(btc_ret)}%\n"
-        f"│ ETH:  {format_value(eth_ret)}%\n"
-        f"│ Gap:  {format_value(gap)}%\n"
-        f"└─────────────────────\n"
-        f"\n"
-        f"⏳ Next scan in 5 minutes..."
     )
 
 
@@ -302,17 +528,58 @@ def fetch_prices() -> Optional[PriceData]:
 
 
 # =============================================================================
+# Price History Management
+# =============================================================================
+def append_price(timestamp: datetime, btc: Decimal, eth: Decimal) -> None:
+    """Append a new price point to history."""
+    price_history.append(PricePoint(timestamp, btc, eth))
+    logger.debug(f"Stored price point: BTC=${float(btc):,.2f}, ETH=${float(eth):,.2f}")
+
+
+def prune_history(now: datetime) -> None:
+    """Remove price points older than 24h + buffer."""
+    global price_history
+    cutoff = now - timedelta(hours=LOOKBACK_HOURS, minutes=HISTORY_BUFFER_MINUTES)
+    original_len = len(price_history)
+    price_history = [p for p in price_history if p.timestamp >= cutoff]
+    pruned = original_len - len(price_history)
+    if pruned > 0:
+        logger.debug(f"Pruned {pruned} old price points, {len(price_history)} remaining")
+
+
+def get_lookback_price(now: datetime) -> Optional[PricePoint]:
+    """
+    Find the price point closest to LOOKBACK_HOURS ago.
+    Returns None if no data from ~24h ago exists.
+    """
+    target_time = now - timedelta(hours=LOOKBACK_HOURS)
+    
+    # Find the closest point to 24h ago (within 30 min tolerance)
+    best_point = None
+    best_diff = timedelta(minutes=30)  # Max tolerance
+    
+    for point in price_history:
+        diff = abs(point.timestamp - target_time)
+        if diff < best_diff:
+            best_diff = diff
+            best_point = point
+    
+    return best_point
+
+
+# =============================================================================
 # Return Calculation
 # =============================================================================
 def compute_returns(
     btc_now: Decimal, eth_now: Decimal, btc_prev: Decimal, eth_prev: Decimal
 ) -> Tuple[Decimal, Decimal, Decimal]:
     """
-    Compute percentage change since last scan and gap.
+    Compute percentage change and gap.
+    Formula: (Current - Previous) / Previous × 100
     Returns: (btc_change_pct, eth_change_pct, gap)
     Gap = ETH change - BTC change
-    Positive gap = ETH moved more than BTC (pumped more or dumped less)
-    Negative gap = BTC moved more than ETH (pumped more or dumped less)
+    Positive gap = ETH outperformed BTC
+    Negative gap = BTC outperformed ETH
     """
     btc_change = (btc_now - btc_prev) / btc_prev * Decimal("100")
     eth_change = (eth_now - eth_prev) / eth_prev * Decimal("100")
@@ -350,9 +617,13 @@ def evaluate_and_transition(
 
     gap_float = float(gap)
     
+    entry_thresh = settings["entry_threshold"]
+    exit_thresh = settings["exit_threshold"]
+    invalid_thresh = settings["invalidation_threshold"]
+    
     if current_mode == Mode.SCAN:
         # Check for entry signals
-        if gap_float >= ENTRY_THRESHOLD:
+        if gap_float >= entry_thresh:
             # S1: Long BTC / Short ETH
             active_strategy = Strategy.S1
             current_mode = Mode.TRACK
@@ -360,7 +631,7 @@ def evaluate_and_transition(
             send_alert(message)
             logger.info(f"ENTRY S1 triggered. Gap: {gap_float:.2f}%")
         
-        elif gap_float <= -ENTRY_THRESHOLD:
+        elif gap_float <= -entry_thresh:
             # S2: Long ETH / Short BTC
             active_strategy = Strategy.S2
             current_mode = Mode.TRACK
@@ -373,7 +644,7 @@ def evaluate_and_transition(
     
     elif current_mode == Mode.TRACK:
         # Check for exit
-        if abs(gap_float) <= EXIT_THRESHOLD:
+        if abs(gap_float) <= exit_thresh:
             message = build_exit_message(btc_ret, eth_ret, gap)
             send_alert(message)
             logger.info(f"EXIT triggered. Gap: {gap_float:.2f}%")
@@ -382,7 +653,7 @@ def evaluate_and_transition(
             return
         
         # Check for invalidation
-        if active_strategy == Strategy.S1 and gap_float >= INVALIDATION_THRESHOLD:
+        if active_strategy == Strategy.S1 and gap_float >= invalid_thresh:
             message = build_invalidation_message(Strategy.S1, btc_ret, eth_ret, gap)
             send_alert(message)
             logger.info(f"INVALIDATION S1 triggered. Gap: {gap_float:.2f}%")
@@ -390,7 +661,7 @@ def evaluate_and_transition(
             active_strategy = None
             return
         
-        if active_strategy == Strategy.S2 and gap_float <= -INVALIDATION_THRESHOLD:
+        if active_strategy == Strategy.S2 and gap_float <= -invalid_thresh:
             message = build_invalidation_message(Strategy.S2, btc_ret, eth_ret, gap)
             send_alert(message)
             logger.info(f"INVALIDATION S2 triggered. Gap: {gap_float:.2f}%")
@@ -427,13 +698,42 @@ def send_startup_message() -> bool:
         "🤖 *Monk Bot Started*\n"
         f"{price_info}"
         "\n"
-        f"📈 Entry threshold: ±{ENTRY_THRESHOLD}%\n"
-        f"📉 Exit threshold: ±{EXIT_THRESHOLD}%\n"
-        f"⚠️ Invalidation: ±{INVALIDATION_THRESHOLD}%\n"
+        f"📊 Rolling 24h % change (perp-exchange style)\n"
+        f"📈 Entry threshold: ±{settings['entry_threshold']}%\n"
+        f"📉 Exit threshold: ±{settings['exit_threshold']}%\n"
+        f"⚠️ Invalidation: ±{settings['invalidation_threshold']}%\n"
+        f"⏱️ Scan interval: {settings['scan_interval']}s\n"
         "\n"
-        "🔍 Scanning for BTC/ETH divergence..."
+        "⏳ Building 24h price history...\n"
+        "_Signals will start after 24h of data collected_\n"
+        "\n"
+        "💡 Type `/settings` to view/change settings"
     )
     return send_alert(message)
+
+
+# =============================================================================
+# Command Polling Thread
+# =============================================================================
+command_thread_running = True
+
+
+def command_polling_thread() -> None:
+    """
+    Background thread using Telegram long polling.
+    
+    Long polling keeps the connection open until an update arrives,
+    so commands are received instantly without hammering the API.
+    """
+    global command_thread_running
+    
+    while command_thread_running:
+        try:
+            process_commands()
+            # No sleep needed - long polling waits up to 30s for updates
+        except Exception as e:
+            logger.debug(f"Command polling error: {e}")
+            time.sleep(5)  # Brief pause only on errors
 
 
 # =============================================================================
@@ -441,13 +741,19 @@ def send_startup_message() -> bool:
 # =============================================================================
 def main_loop() -> None:
     """Main polling and evaluation loop."""
-    global current_mode, active_strategy, previous_btc, previous_eth
+    global current_mode, active_strategy, command_thread_running
 
     logger.info("=" * 60)
     logger.info("Monk Bot starting")
-    logger.info(f"Thresholds - Entry: {ENTRY_THRESHOLD}%, Exit: {EXIT_THRESHOLD}%, Invalidation: {INVALIDATION_THRESHOLD}%")
-    logger.info(f"Scan interval: {SCAN_INTERVAL_SECONDS}s")
+    logger.info(f"Using rolling 24h price change (perp-exchange style)")
+    logger.info(f"Thresholds - Entry: {settings['entry_threshold']}%, Exit: {settings['exit_threshold']}%, Invalidation: {settings['invalidation_threshold']}%")
+    logger.info(f"Scan interval: {settings['scan_interval']}s")
     logger.info("=" * 60)
+
+    # Start command polling thread
+    cmd_thread = threading.Thread(target=command_polling_thread, daemon=True)
+    cmd_thread.start()
+    logger.info("Command listener started (long polling - instant response)")
 
     # Send startup message to verify Telegram
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -459,7 +765,6 @@ def main_loop() -> None:
     while True:
         try:
             now = datetime.now(timezone.utc)
-            signal_triggered = False
             
             # Fetch prices
             price_data = fetch_prices()
@@ -470,55 +775,48 @@ def main_loop() -> None:
                 # Check freshness
                 if not is_data_fresh(now, price_data.btc_updated_at, price_data.eth_updated_at):
                     logger.warning("Data not fresh, skipping evaluation")
-                elif previous_btc is None or previous_eth is None:
-                    # First scan - just store prices
-                    previous_btc = price_data.btc_price
-                    previous_eth = price_data.eth_price
-                    logger.info(f"First scan - stored prices. BTC: ${float(previous_btc):,.2f}, ETH: ${float(previous_eth):,.2f}")
-                    logger.info("Will compare on next scan in 5 minutes...")
                 else:
-                    # Compute change since last scan
-                    btc_ret, eth_ret, gap = compute_returns(
-                        price_data.btc_price,
-                        price_data.eth_price,
-                        previous_btc,
-                        previous_eth,
-                    )
+                    # Store current price in history
+                    append_price(now, price_data.btc_price, price_data.eth_price)
                     
-                    logger.info(
-                        f"Mode: {current_mode.value} | "
-                        f"BTC: {format_value(btc_ret)}% | "
-                        f"ETH: {format_value(eth_ret)}% | "
-                        f"Gap: {format_value(gap)}%"
-                    )
+                    # Prune old data
+                    prune_history(now)
                     
-                    # Track previous mode to detect signal
-                    prev_mode = current_mode
+                    # Get price from 24h ago
+                    price_24h_ago = get_lookback_price(now)
                     
-                    # Evaluate state machine
-                    evaluate_and_transition(btc_ret, eth_ret, gap)
-                    
-                    # Check if a signal was triggered (mode changed)
-                    if current_mode != prev_mode:
-                        signal_triggered = True
-                    
-                    # Send status message when in SCAN mode and no signal found
-                    if current_mode == Mode.SCAN and not signal_triggered:
-                        message = build_no_signal_message(
+                    if price_24h_ago is None:
+                        hours_of_data = len(price_history) * settings["scan_interval"] / 3600
+                        logger.info(f"Building 24h history... ({hours_of_data:.1f}h collected, need 24h)")
+                    else:
+                        # Compute 24h change (perp-exchange style)
+                        btc_ret, eth_ret, gap = compute_returns(
                             price_data.btc_price,
                             price_data.eth_price,
-                            btc_ret, eth_ret, gap
+                            price_24h_ago.btc,
+                            price_24h_ago.eth,
                         )
-                        send_alert(message)
-                        logger.info("No signal - status sent")
-                    
-                    # Update previous prices for next comparison
-                    previous_btc = price_data.btc_price
-                    previous_eth = price_data.eth_price
+                        
+                        logger.info(
+                            f"Mode: {current_mode.value} | "
+                            f"BTC 24h: {format_value(btc_ret)}% | "
+                            f"ETH 24h: {format_value(eth_ret)}% | "
+                            f"Gap: {format_value(gap)}%"
+                        )
+                        
+                        # Track previous mode to detect signal
+                        prev_mode = current_mode
+                        
+                        # Evaluate state machine
+                        evaluate_and_transition(btc_ret, eth_ret, gap)
+                        
+                        # Log if no signal triggered (no message sent - alerts only on entry/exit)
+                        if current_mode == prev_mode:
+                            logger.info(f"No signal | Gap: {float(gap):.2f}%")
             
-            # Sleep based on current mode
-            sleep_time = TRACK_INTERVAL_SECONDS if current_mode == Mode.TRACK else SCAN_INTERVAL_SECONDS
-            logger.debug(f"Sleeping for {sleep_time} seconds")
+            # Sleep until next scan (commands handled by background thread)
+            sleep_time = settings["scan_interval"]
+            logger.debug(f"Next scan in {sleep_time} seconds")
             time.sleep(sleep_time)
             
         except KeyboardInterrupt:
