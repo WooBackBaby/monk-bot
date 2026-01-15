@@ -4,7 +4,7 @@ A lightweight Python bot that monitors BTC/ETH price divergence and sends Telegr
 
 ## Strategy
 
-The bot implements a pairs trading strategy based on BTC/ETH relative performance:
+The bot implements a pairs trading strategy based on BTC/ETH relative performance over a configurable lookback period (default: 1 hour).
 
 **Strategy 1 (S1): Long BTC / Short ETH**
 - Triggers when ETH pumps more than BTC (gap >= +2%)
@@ -16,10 +16,10 @@ The bot implements a pairs trading strategy based on BTC/ETH relative performanc
 
 ### How It Works
 
-1. Bot scans BTC and ETH prices every 5 minutes
-2. Calculates % change since last scan for each
-3. Gap = ETH change - BTC change
-4. If gap exceeds threshold, sends alert
+1. Bot scans BTC and ETH mark prices every 5 minutes
+2. Calculates rolling % change over the lookback period (1h-24h)
+3. Gap = ETH % change - BTC % change
+4. If gap exceeds threshold, sends Telegram alert
 
 ### Signal Types
 
@@ -29,6 +29,23 @@ The bot implements a pairs trading strategy based on BTC/ETH relative performanc
 | **S2 ENTRY** | Gap <= -2.0% | Long ETH / Short BTC |
 | **EXIT** | Gap returns to ±0.5% | Close positions |
 | **INVALIDATION** | Gap exceeds ±4.0% | Stop loss |
+
+## Telegram Commands
+
+Control the bot directly from Telegram by messaging it:
+
+| Command | Description |
+|---------|-------------|
+| `/settings` | View current settings |
+| `/lookback <hours>` | Set lookback period (1-24h) |
+| `/interval <seconds>` | Set scan interval (60-3600s) |
+| `/threshold entry <val>` | Set entry threshold % |
+| `/threshold exit <val>` | Set exit threshold % |
+| `/threshold invalid <val>` | Set invalidation threshold % |
+| `/status` | View bot status and data collection progress |
+| `/help` | Show all commands |
+
+Commands respond instantly using Telegram long polling.
 
 ## Requirements
 
@@ -41,7 +58,7 @@ The bot implements a pairs trading strategy based on BTC/ETH relative performanc
 ### 1. Clone Repository
 
 ```bash
-git clone https://github.com/yourusername/monk-bot.git
+git clone https://github.com/WooBackBaby/monk-bot.git
 cd monk-bot
 ```
 
@@ -103,14 +120,17 @@ sudo journalctl -u omni_pairs_bot -f
 
 ## Configuration
 
-Edit `config.py` to customize thresholds:
+Default settings (all configurable via Telegram commands):
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `ENTRY_THRESHOLD` | 2.0 | Gap % to trigger entry |
-| `EXIT_THRESHOLD` | 0.5 | Gap % to trigger exit |
-| `INVALIDATION_THRESHOLD` | 4.0 | Gap % for stop loss |
-| `SCAN_INTERVAL_SECONDS` | 300 | Time between scans (5 min) |
+| `lookback_hours` | 1 | Lookback period for % change (1-24h) |
+| `scan_interval` | 300 | Time between scans in seconds (5 min) |
+| `entry_threshold` | 2.0 | Gap % to trigger entry |
+| `exit_threshold` | 0.5 | Gap % to trigger exit |
+| `invalidation_threshold` | 4.0 | Gap % for stop loss |
+
+**Note:** With 1h lookback, the bot starts sending signals after ~1 hour of data collection. Use `/lookback 24` for daily timeframe analysis.
 
 ## API
 

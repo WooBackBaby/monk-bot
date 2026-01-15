@@ -32,8 +32,8 @@ from config import (
 # =============================================================================
 # Constants
 # =============================================================================
-LOOKBACK_HOURS = 24
-HISTORY_BUFFER_MINUTES = 30  # Extra buffer beyond 24h
+DEFAULT_LOOKBACK_HOURS = 1  # Default to 1h for faster startup
+HISTORY_BUFFER_MINUTES = 30  # Extra buffer beyond lookback period
 
 
 # =============================================================================
@@ -75,6 +75,7 @@ settings = {
     "entry_threshold": ENTRY_THRESHOLD,
     "exit_threshold": EXIT_THRESHOLD,
     "invalidation_threshold": INVALIDATION_THRESHOLD,
+    "lookback_hours": DEFAULT_LOOKBACK_HOURS,
 }
 
 # Track last processed update to avoid duplicates
@@ -191,6 +192,8 @@ def process_commands() -> None:
             handle_help_command(reply_chat)
         elif command == "/status":
             handle_status_command(reply_chat)
+        elif command == "/lookback":
+            handle_lookback_command(args, reply_chat)
         elif command == "/start":
             handle_help_command(reply_chat)
 
@@ -224,14 +227,15 @@ def handle_settings_command(reply_chat: str) -> None:
         "⚙️ *Current Settings*\n"
         "\n"
         f"📊 Scan Interval: {settings['scan_interval']} seconds ({settings['scan_interval'] // 60} min)\n"
+        f"🕐 Lookback Period: {settings['lookback_hours']}h\n"
         f"📈 Entry Threshold: ±{settings['entry_threshold']}%\n"
         f"📉 Exit Threshold: ±{settings['exit_threshold']}%\n"
         f"⚠️ Invalidation: ±{settings['invalidation_threshold']}%\n"
         "\n"
         "*Commands:*\n"
         "`/interval <seconds>` - Set scan interval\n"
-        "`/threshold <entry> <exit> <invalid>` - Set thresholds\n"
-        "`/status` - Show bot status\n"
+        "`/lookback <hours>` - Set lookback (1-24h)\n"
+        "`/threshold <type> <value>` - Set thresholds\n"
         "`/help` - Show all commands"
     )
     send_reply(message, reply_chat)
@@ -304,6 +308,44 @@ def handle_threshold_command(args: list, reply_chat: str) -> None:
         send_reply("❌ Invalid number", reply_chat)
 
 
+def handle_lookback_command(args: list, reply_chat: str) -> None:
+    """Set lookback period in hours."""
+    global price_history
+    
+    if not args:
+        send_reply(
+            f"📊 Current lookback: *{settings['lookback_hours']}h*\n\n"
+            "Usage: `/lookback <hours>`\n"
+            "Example: `/lookback 1` or `/lookback 24`",
+            reply_chat
+        )
+        return
+    
+    try:
+        new_lookback = int(args[0])
+        if new_lookback < 1:
+            send_reply("❌ Minimum lookback is 1 hour", reply_chat)
+            return
+        if new_lookback > 24:
+            send_reply("❌ Maximum lookback is 24 hours", reply_chat)
+            return
+        
+        old_lookback = settings["lookback_hours"]
+        settings["lookback_hours"] = new_lookback
+        
+        # Clear history when changing lookback to rebuild
+        price_history = []
+        
+        send_reply(
+            f"✅ Lookback changed from *{old_lookback}h* to *{new_lookback}h*\n\n"
+            f"⚠️ Price history cleared - collecting new {new_lookback}h data...",
+            reply_chat
+        )
+        logger.info(f"Lookback changed from {old_lookback}h to {new_lookback}h via command")
+    except ValueError:
+        send_reply("❌ Invalid number. Usage: `/lookback <hours>`", reply_chat)
+
+
 def handle_help_command(reply_chat: str) -> None:
     """Show help message."""
     message = (
@@ -312,6 +354,7 @@ def handle_help_command(reply_chat: str) -> None:
         "*Settings:*\n"
         "`/settings` - Show current settings\n"
         "`/interval <sec>` - Set scan interval (60-3600)\n"
+        "`/lookback <hours>` - Set lookback period (1-24)\n"
         "`/threshold entry <val>` - Entry threshold %\n"
         "`/threshold exit <val>` - Exit threshold %\n"
         "`/threshold invalid <val>` - Invalidation %\n"
@@ -326,13 +369,16 @@ def handle_help_command(reply_chat: str) -> None:
 def handle_status_command(reply_chat: str) -> None:
     """Show bot status."""
     hours_of_data = len(price_history) * settings["scan_interval"] / 3600
+    lookback = settings["lookback_hours"]
+    ready = "✅ Ready" if hours_of_data >= lookback else f"⏳ {hours_of_data:.1f}h / {lookback}h"
     
     message = (
         "📊 *Bot Status*\n"
         "\n"
         f"Mode: {current_mode.value}\n"
         f"Active Strategy: {active_strategy.value if active_strategy else 'None'}\n"
-        f"History: {hours_of_data:.1f}h collected\n"
+        f"Lookback: {lookback}h\n"
+        f"History: {ready}\n"
         f"Data Points: {len(price_history)}\n"
     )
     send_reply(message, reply_chat)
@@ -361,14 +407,26 @@ def format_value(value: Decimal) -> str:
 # =============================================================================
 # Message Building
 # =============================================================================
+def get_lookback_label() -> str:
+    """Get human-readable lookback period label."""
+    hours = settings["lookback_hours"]
+    if hours == 1:
+        return "1h"
+    elif hours == 24:
+        return "24h"
+    else:
+        return f"{hours}h"
+
+
 def build_entry_message(strategy: Strategy, btc_ret: Decimal, eth_ret: Decimal, gap: Decimal) -> str:
     """Build ENTRY alert message."""
+    lb = get_lookback_label()
     if strategy == Strategy.S1:
         direction = "📈 Long BTC / Short ETH"
-        reason = "ETH pumped more than BTC (24h)"
+        reason = f"ETH pumped more than BTC ({lb})"
     else:
         direction = "📈 Long ETH / Short BTC"
-        reason = "ETH dumped more than BTC (24h)"
+        reason = f"ETH dumped more than BTC ({lb})"
 
     return (
         f"🚨 *ENTRY SIGNAL: {strategy.value}*\n"
@@ -376,7 +434,7 @@ def build_entry_message(strategy: Strategy, btc_ret: Decimal, eth_ret: Decimal, 
         f"{direction}\n"
         f"_{reason}_\n"
         f"\n"
-        f"*24h Change:*\n"
+        f"*{lb} Change:*\n"
         f"┌─────────────────────\n"
         f"│ BTC:  {format_value(btc_ret)}%\n"
         f"│ ETH:  {format_value(eth_ret)}%\n"
@@ -389,12 +447,13 @@ def build_entry_message(strategy: Strategy, btc_ret: Decimal, eth_ret: Decimal, 
 
 def build_exit_message(btc_ret: Decimal, eth_ret: Decimal, gap: Decimal) -> str:
     """Build EXIT alert message."""
+    lb = get_lookback_label()
     return (
         f"✅ *EXIT SIGNAL*\n"
         f"\n"
         f"Gap converged - position profitable.\n"
         f"\n"
-        f"*24h Change:*\n"
+        f"*{lb} Change:*\n"
         f"┌─────────────────────\n"
         f"│ BTC:  {format_value(btc_ret)}%\n"
         f"│ ETH:  {format_value(eth_ret)}%\n"
@@ -407,12 +466,13 @@ def build_exit_message(btc_ret: Decimal, eth_ret: Decimal, gap: Decimal) -> str:
 
 def build_invalidation_message(strategy: Strategy, btc_ret: Decimal, eth_ret: Decimal, gap: Decimal) -> str:
     """Build INVALIDATION alert message."""
+    lb = get_lookback_label()
     return (
         f"⚠️ *INVALIDATION: {strategy.value}*\n"
         f"\n"
         f"Gap widened further - consider closing.\n"
         f"\n"
-        f"*24h Change:*\n"
+        f"*{lb} Change:*\n"
         f"┌─────────────────────\n"
         f"│ BTC:  {format_value(btc_ret)}%\n"
         f"│ ETH:  {format_value(eth_ret)}%\n"
@@ -537,9 +597,10 @@ def append_price(timestamp: datetime, btc: Decimal, eth: Decimal) -> None:
 
 
 def prune_history(now: datetime) -> None:
-    """Remove price points older than 24h + buffer."""
+    """Remove price points older than lookback period + buffer."""
     global price_history
-    cutoff = now - timedelta(hours=LOOKBACK_HOURS, minutes=HISTORY_BUFFER_MINUTES)
+    lookback = settings["lookback_hours"]
+    cutoff = now - timedelta(hours=lookback, minutes=HISTORY_BUFFER_MINUTES)
     original_len = len(price_history)
     price_history = [p for p in price_history if p.timestamp >= cutoff]
     pruned = original_len - len(price_history)
@@ -549,12 +610,13 @@ def prune_history(now: datetime) -> None:
 
 def get_lookback_price(now: datetime) -> Optional[PricePoint]:
     """
-    Find the price point closest to LOOKBACK_HOURS ago.
-    Returns None if no data from ~24h ago exists.
+    Find the price point closest to lookback_hours ago.
+    Returns None if no data from that time exists.
     """
-    target_time = now - timedelta(hours=LOOKBACK_HOURS)
+    lookback = settings["lookback_hours"]
+    target_time = now - timedelta(hours=lookback)
     
-    # Find the closest point to 24h ago (within 30 min tolerance)
+    # Find the closest point to target time (within 30 min tolerance)
     best_point = None
     best_diff = timedelta(minutes=30)  # Max tolerance
     
@@ -694,20 +756,21 @@ def send_startup_message() -> bool:
     else:
         price_info = "\n⚠️ Unable to fetch current prices\n"
     
+    lb = get_lookback_label()
     message = (
         "🤖 *Monk Bot Started*\n"
         f"{price_info}"
         "\n"
-        f"📊 Rolling 24h % change (perp-exchange style)\n"
+        f"📊 Rolling {lb} % change (perp-exchange style)\n"
         f"📈 Entry threshold: ±{settings['entry_threshold']}%\n"
         f"📉 Exit threshold: ±{settings['exit_threshold']}%\n"
         f"⚠️ Invalidation: ±{settings['invalidation_threshold']}%\n"
         f"⏱️ Scan interval: {settings['scan_interval']}s\n"
         "\n"
-        "⏳ Building 24h price history...\n"
-        "_Signals will start after 24h of data collected_\n"
+        f"⏳ Building {lb} price history...\n"
+        f"_Signals will start after {lb} of data collected_\n"
         "\n"
-        "💡 Type `/settings` to view/change settings"
+        "💡 Type `/help` for commands"
     )
     return send_alert(message)
 
@@ -745,7 +808,7 @@ def main_loop() -> None:
 
     logger.info("=" * 60)
     logger.info("Monk Bot starting")
-    logger.info(f"Using rolling 24h price change (perp-exchange style)")
+    logger.info(f"Using rolling {settings['lookback_hours']}h price change (perp-exchange style)")
     logger.info(f"Thresholds - Entry: {settings['entry_threshold']}%, Exit: {settings['exit_threshold']}%, Invalidation: {settings['invalidation_threshold']}%")
     logger.info(f"Scan interval: {settings['scan_interval']}s")
     logger.info("=" * 60)
@@ -782,25 +845,26 @@ def main_loop() -> None:
                     # Prune old data
                     prune_history(now)
                     
-                    # Get price from 24h ago
-                    price_24h_ago = get_lookback_price(now)
+                    # Get price from lookback period ago
+                    lb = settings["lookback_hours"]
+                    price_then = get_lookback_price(now)
                     
-                    if price_24h_ago is None:
+                    if price_then is None:
                         hours_of_data = len(price_history) * settings["scan_interval"] / 3600
-                        logger.info(f"Building 24h history... ({hours_of_data:.1f}h collected, need 24h)")
+                        logger.info(f"Building {lb}h history... ({hours_of_data:.1f}h collected, need {lb}h)")
                     else:
-                        # Compute 24h change (perp-exchange style)
+                        # Compute % change (perp-exchange style)
                         btc_ret, eth_ret, gap = compute_returns(
                             price_data.btc_price,
                             price_data.eth_price,
-                            price_24h_ago.btc,
-                            price_24h_ago.eth,
+                            price_then.btc,
+                            price_then.eth,
                         )
                         
                         logger.info(
                             f"Mode: {current_mode.value} | "
-                            f"BTC 24h: {format_value(btc_ret)}% | "
-                            f"ETH 24h: {format_value(eth_ret)}% | "
+                            f"BTC {lb}h: {format_value(btc_ret)}% | "
+                            f"ETH {lb}h: {format_value(eth_ret)}% | "
                             f"Gap: {format_value(gap)}%"
                         )
                         
