@@ -39,6 +39,7 @@ Control the bot directly from Telegram by messaging it:
 | `/settings` | View current settings |
 | `/lookback <hours>` | Set lookback period (1-24h) |
 | `/interval <seconds>` | Set scan interval (60-3600s) |
+| `/heartbeat <minutes>` | Set status update interval (0 to disable) |
 | `/threshold entry <val>` | Set entry threshold % |
 | `/threshold exit <val>` | Set exit threshold % |
 | `/threshold invalid <val>` | Set invalidation threshold % |
@@ -46,6 +47,8 @@ Control the bot directly from Telegram by messaging it:
 | `/help` | Show all commands |
 
 Commands respond instantly using Telegram long polling.
+
+The bot sends a heartbeat message every 30 minutes (configurable) with a summary of scans performed and current prices.
 
 ## Requirements
 
@@ -126,6 +129,7 @@ Default settings (all configurable via Telegram commands):
 |-----------|---------|-------------|
 | `lookback_hours` | 1 | Lookback period for % change (1-24h) |
 | `scan_interval` | 300 | Time between scans in seconds (5 min) |
+| `heartbeat_minutes` | 30 | Status update interval (0 to disable) |
 | `entry_threshold` | 2.0 | Gap % to trigger entry |
 | `exit_threshold` | 0.5 | Gap % to trigger exit |
 | `invalidation_threshold` | 4.0 | Gap % for stop loss |

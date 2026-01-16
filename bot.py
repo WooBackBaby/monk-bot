@@ -76,10 +76,21 @@ settings = {
     "exit_threshold": EXIT_THRESHOLD,
     "invalidation_threshold": INVALIDATION_THRESHOLD,
     "lookback_hours": DEFAULT_LOOKBACK_HOURS,
+    "heartbeat_minutes": 30,  # Send summary every 30 minutes
 }
 
 # Track last processed update to avoid duplicates
 last_update_id: int = 0
+
+# Heartbeat tracking
+last_heartbeat_time: Optional[datetime] = None
+scan_stats = {
+    "count": 0,
+    "last_btc_price": None,
+    "last_eth_price": None,
+    "last_gap": None,
+    "signals_sent": 0,
+}
 
 
 # =============================================================================
@@ -194,6 +205,8 @@ def process_commands() -> None:
             handle_status_command(reply_chat)
         elif command == "/lookback":
             handle_lookback_command(args, reply_chat)
+        elif command == "/heartbeat":
+            handle_heartbeat_command(args, reply_chat)
         elif command == "/start":
             handle_help_command(reply_chat)
 
@@ -223,19 +236,20 @@ def send_reply(message: str, chat_id: str) -> bool:
 
 def handle_settings_command(reply_chat: str) -> None:
     """Show current settings."""
+    hb = settings['heartbeat_minutes']
+    hb_str = f"{hb} min" if hb > 0 else "Off"
     message = (
         "⚙️ *Current Settings*\n"
         "\n"
-        f"📊 Scan Interval: {settings['scan_interval']} seconds ({settings['scan_interval'] // 60} min)\n"
+        f"📊 Scan Interval: {settings['scan_interval']}s ({settings['scan_interval'] // 60} min)\n"
         f"🕐 Lookback Period: {settings['lookback_hours']}h\n"
+        f"💓 Heartbeat: {hb_str}\n"
         f"📈 Entry Threshold: ±{settings['entry_threshold']}%\n"
         f"📉 Exit Threshold: ±{settings['exit_threshold']}%\n"
         f"⚠️ Invalidation: ±{settings['invalidation_threshold']}%\n"
         "\n"
         "*Commands:*\n"
-        "`/interval <seconds>` - Set scan interval\n"
-        "`/lookback <hours>` - Set lookback (1-24h)\n"
-        "`/threshold <type> <value>` - Set thresholds\n"
+        "`/interval`, `/lookback`, `/heartbeat`, `/threshold`\n"
         "`/help` - Show all commands"
     )
     send_reply(message, reply_chat)
@@ -346,6 +360,39 @@ def handle_lookback_command(args: list, reply_chat: str) -> None:
         send_reply("❌ Invalid number. Usage: `/lookback <hours>`", reply_chat)
 
 
+def handle_heartbeat_command(args: list, reply_chat: str) -> None:
+    """Set heartbeat interval in minutes."""
+    if not args:
+        send_reply(
+            f"💓 Current heartbeat: *{settings['heartbeat_minutes']} minutes*\n\n"
+            "Usage: `/heartbeat <minutes>`\n"
+            "Example: `/heartbeat 30` or `/heartbeat 0` to disable",
+            reply_chat
+        )
+        return
+    
+    try:
+        new_interval = int(args[0])
+        if new_interval < 0:
+            send_reply("❌ Interval cannot be negative", reply_chat)
+            return
+        if new_interval > 120:
+            send_reply("❌ Maximum interval is 120 minutes", reply_chat)
+            return
+        
+        old_interval = settings["heartbeat_minutes"]
+        settings["heartbeat_minutes"] = new_interval
+        
+        if new_interval == 0:
+            send_reply("✅ Heartbeat *disabled*", reply_chat)
+        else:
+            send_reply(f"✅ Heartbeat interval set to *{new_interval} minutes*", reply_chat)
+        
+        logger.info(f"Heartbeat changed from {old_interval}min to {new_interval}min via command")
+    except ValueError:
+        send_reply("❌ Invalid number. Usage: `/heartbeat <minutes>`", reply_chat)
+
+
 def handle_help_command(reply_chat: str) -> None:
     """Show help message."""
     message = (
@@ -355,6 +402,7 @@ def handle_help_command(reply_chat: str) -> None:
         "`/settings` - Show current settings\n"
         "`/interval <sec>` - Set scan interval (60-3600)\n"
         "`/lookback <hours>` - Set lookback period (1-24)\n"
+        "`/heartbeat <min>` - Set status update interval (0=off)\n"
         "`/threshold entry <val>` - Entry threshold %\n"
         "`/threshold exit <val>` - Exit threshold %\n"
         "`/threshold invalid <val>` - Invalidation %\n"
@@ -481,6 +529,79 @@ def build_invalidation_message(strategy: Strategy, btc_ret: Decimal, eth_ret: De
         f"\n"
         f"🔍 Returning to scan mode"
     )
+
+
+def build_heartbeat_message() -> str:
+    """Build periodic status/heartbeat message."""
+    lb = get_lookback_label()
+    
+    # Format prices
+    btc_str = f"${float(scan_stats['last_btc_price']):,.2f}" if scan_stats['last_btc_price'] else "N/A"
+    eth_str = f"${float(scan_stats['last_eth_price']):,.2f}" if scan_stats['last_eth_price'] else "N/A"
+    gap_str = f"{format_value(scan_stats['last_gap'])}%" if scan_stats['last_gap'] is not None else "N/A"
+    
+    # Calculate data collection status
+    hours_of_data = len(price_history) * settings["scan_interval"] / 3600
+    lookback = settings["lookback_hours"]
+    
+    if hours_of_data >= lookback:
+        data_status = f"✅ Ready ({hours_of_data:.1f}h)"
+    else:
+        data_status = f"⏳ {hours_of_data:.1f}h / {lookback}h"
+    
+    return (
+        f"💓 *Heartbeat*\n"
+        f"\n"
+        f"*Status:* Bot running normally\n"
+        f"*Mode:* {current_mode.value}\n"
+        f"*Strategy:* {active_strategy.value if active_strategy else 'None'}\n"
+        f"\n"
+        f"*Last {settings['heartbeat_minutes']} min:*\n"
+        f"┌─────────────────────\n"
+        f"│ Scans: {scan_stats['count']}\n"
+        f"│ Signals: {scan_stats['signals_sent']}\n"
+        f"└─────────────────────\n"
+        f"\n"
+        f"*Current Prices:*\n"
+        f"┌─────────────────────\n"
+        f"│ BTC: {btc_str}\n"
+        f"│ ETH: {eth_str}\n"
+        f"│ Gap ({lb}): {gap_str}\n"
+        f"└─────────────────────\n"
+        f"\n"
+        f"*Data:* {data_status}\n"
+        f"\n"
+        f"_Next update in {settings['heartbeat_minutes']} min_"
+    )
+
+
+def send_heartbeat() -> bool:
+    """Send heartbeat message and reset stats."""
+    global scan_stats
+    
+    message = build_heartbeat_message()
+    success = send_alert(message)
+    
+    # Reset counters for next period
+    scan_stats["count"] = 0
+    scan_stats["signals_sent"] = 0
+    
+    return success
+
+
+def should_send_heartbeat(now: datetime) -> bool:
+    """Check if it's time to send a heartbeat."""
+    global last_heartbeat_time
+    
+    # Heartbeat disabled
+    if settings["heartbeat_minutes"] == 0:
+        return False
+    
+    if last_heartbeat_time is None:
+        return False  # Don't send immediately on startup
+    
+    minutes_since = (now - last_heartbeat_time).total_seconds() / 60
+    return minutes_since >= settings["heartbeat_minutes"]
 
 
 # =============================================================================
@@ -804,13 +925,13 @@ def command_polling_thread() -> None:
 # =============================================================================
 def main_loop() -> None:
     """Main polling and evaluation loop."""
-    global current_mode, active_strategy, command_thread_running
+    global current_mode, active_strategy, command_thread_running, last_heartbeat_time
 
     logger.info("=" * 60)
     logger.info("Monk Bot starting")
     logger.info(f"Using rolling {settings['lookback_hours']}h price change (perp-exchange style)")
     logger.info(f"Thresholds - Entry: {settings['entry_threshold']}%, Exit: {settings['exit_threshold']}%, Invalidation: {settings['invalidation_threshold']}%")
-    logger.info(f"Scan interval: {settings['scan_interval']}s")
+    logger.info(f"Scan interval: {settings['scan_interval']}s, Heartbeat: {settings['heartbeat_minutes']}min")
     logger.info("=" * 60)
 
     # Start command polling thread
@@ -824,10 +945,19 @@ def main_loop() -> None:
             logger.info("Startup message sent to Telegram")
         else:
             logger.error("Failed to send startup message - check credentials")
+    
+    # Initialize heartbeat timer
+    last_heartbeat_time = datetime.now(timezone.utc)
 
     while True:
         try:
             now = datetime.now(timezone.utc)
+            
+            # Check if heartbeat is due
+            if should_send_heartbeat(now):
+                if send_heartbeat():
+                    last_heartbeat_time = now
+                    logger.info("Heartbeat sent")
             
             # Fetch prices
             price_data = fetch_prices()
@@ -835,6 +965,11 @@ def main_loop() -> None:
             if price_data is None:
                 logger.warning("Failed to fetch prices, skipping this poll")
             else:
+                # Update scan stats with latest prices
+                scan_stats["count"] += 1
+                scan_stats["last_btc_price"] = price_data.btc_price
+                scan_stats["last_eth_price"] = price_data.eth_price
+                
                 # Check freshness
                 if not is_data_fresh(now, price_data.btc_updated_at, price_data.eth_updated_at):
                     logger.warning("Data not fresh, skipping evaluation")
@@ -861,6 +996,9 @@ def main_loop() -> None:
                             price_then.eth,
                         )
                         
+                        # Update scan stats with gap
+                        scan_stats["last_gap"] = gap
+                        
                         logger.info(
                             f"Mode: {current_mode.value} | "
                             f"BTC {lb}h: {format_value(btc_ret)}% | "
@@ -874,8 +1012,10 @@ def main_loop() -> None:
                         # Evaluate state machine
                         evaluate_and_transition(btc_ret, eth_ret, gap)
                         
-                        # Log if no signal triggered (no message sent - alerts only on entry/exit)
-                        if current_mode == prev_mode:
+                        # Track if signal was sent
+                        if current_mode != prev_mode:
+                            scan_stats["signals_sent"] += 1
+                        else:
                             logger.info(f"No signal | Gap: {float(gap):.2f}%")
             
             # Sleep until next scan (commands handled by background thread)
