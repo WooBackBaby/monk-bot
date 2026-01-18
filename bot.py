@@ -32,7 +32,7 @@ from config import (
 # =============================================================================
 # Constants
 # =============================================================================
-DEFAULT_LOOKBACK_HOURS = 1  # Default to 1h for faster startup
+DEFAULT_LOOKBACK_HOURS = 24  # Default to 24h rolling change
 HISTORY_BUFFER_MINUTES = 30  # Extra buffer beyond lookback period
 
 

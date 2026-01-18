@@ -4,7 +4,7 @@ A lightweight Python bot that monitors BTC/ETH price divergence and sends Telegr
 
 ## Strategy
 
-The bot implements a pairs trading strategy based on BTC/ETH relative performance over a configurable lookback period (default: 1 hour).
+The bot implements a pairs trading strategy based on BTC/ETH relative performance over a configurable lookback period (default: 24 hours).
 
 **Strategy 1 (S1): Long BTC / Short ETH**
 - Triggers when ETH pumps more than BTC (gap >= +2%)
@@ -127,14 +127,14 @@ Default settings (all configurable via Telegram commands):
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `lookback_hours` | 1 | Lookback period for % change (1-24h) |
+| `lookback_hours` | 24 | Lookback period for % change (1-24h) |
 | `scan_interval` | 300 | Time between scans in seconds (5 min) |
 | `heartbeat_minutes` | 30 | Status update interval (0 to disable) |
 | `entry_threshold` | 2.0 | Gap % to trigger entry |
 | `exit_threshold` | 0.5 | Gap % to trigger exit |
 | `invalidation_threshold` | 4.0 | Gap % for stop loss |
 
-**Note:** With 1h lookback, the bot starts sending signals after ~1 hour of data collection. Use `/lookback 24` for daily timeframe analysis.
+**Note:** With 24h lookback (default), the bot needs ~24 hours of data collection before sending signals. Use `/lookback 1` for faster startup with 1-hour timeframe.
 
 ## API
 
